@@ -1,0 +1,46 @@
+# Image for running Claude Code with only chosen directories mounted.
+#
+# Claude itself is not installed here: the host's claude binary is
+# bind-mounted at runtime. That binary is dynamically linked, so it runs
+# against this image's glibc; Arch keeps a recent one. See README.md.
+
+FROM docker.io/library/archlinux:latest
+
+# python: the herdr state hook. bubblewrap + socat: Claude Code's own sandbox.
+RUN pacman -Syu --noconfirm \
+        git openssh ca-certificates ripgrep fd less which base-devel \
+        bubblewrap socat python \
+    && pacman -Scc --noconfirm
+
+# Mirrors the host user: same UID/GID for --userns=keep-id, home at
+# /home/$USERNAME so mounts resolve identically inside and out.
+ARG USERNAME=claude
+ARG UID=1000
+ARG GID=1000
+
+RUN groupadd -g "$GID" "$USERNAME" 2>/dev/null || true && \
+    useradd -m -u "$UID" -g "$GID" -s /bin/bash "$USERNAME"
+
+# Tools assume these exist; some create nested paths without parents=True.
+RUN install -d -o "$UID" -g "$GID" \
+        "/home/$USERNAME/.cache" \
+        "/home/$USERNAME/.config" \
+        "/home/$USERNAME/.local/share"
+
+# The mounted claude binary is read-only, so self-update must not run.
+ENV DISABLE_AUTOUPDATER=1
+ENV DISABLE_UPDATES=1
+ENV DISABLE_INSTALLATION_CHECKS=1
+
+# The image carries no generated locales; C.UTF-8 is built into glibc.
+ENV LANG=C.UTF-8
+
+# The host CUDA toolkit is mounted here with CLAUDE_BOX_GPU=1; empty otherwise.
+ENV PATH=/opt/cuda/bin:$PATH
+
+USER $USERNAME
+WORKDIR /home/$USERNAME
+
+# Fallback only, and correct only for the default CLAUDE_BOX_CLAUDE_DIR;
+# claude-box always passes --entrypoint.
+ENTRYPOINT ["/opt/claude-code/bin/claude"]

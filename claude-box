@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# Run Claude Code inside a rootless podman container, with only the
+# directories you name mounted. See README.md.
+#
+# Usage:
+#   claude-box [-m DIR]... [-e PIXI_ENV] [--manifest pixi.toml] [claude args...]
+#   claude-box --build
+#
+# Environment:
+#   CLAUDE_BOX_MOUNTS=dir1:dir2     default mounts when no -m is given
+#   CLAUDE_BOX_ENV=dev              launch inside this pixi environment
+#   CLAUDE_BOX_MANIFEST=path        pixi.toml to resolve that environment
+#                                   against, instead of searching upward
+#   CLAUDE_BOX_GPU=1                pass through the NVIDIA GPU
+#   CLAUDE_BOX_CUDA_DIR=path        host CUDA toolkit, mounted at /opt/cuda
+#                                   with the GPU (default /opt/cuda)
+#   CLAUDE_BOX_IMAGE=name           image tag (default claude-box:latest)
+#   CLAUDE_BOX_CLAUDE_DIR=path      host directory holding bin/claude
+#                                   (default /opt/claude-code)
+#   CLAUDE_BOX_PASSENV=VAR1:VAR2    also forward these variables by name
+#   CLAUDE_BOX_NO_CLAUDE_JSON=1     swap ~/.claude.json for a container-only
+#                                   copy; authenticate with ANTHROPIC_API_KEY
+#   CLAUDE_BOX_UNSAFE_GIT=1         do not protect .git/config and .git/hooks
+#                                   (they run on the host later)
+#
+# ANTHROPIC_API_KEY is forwarded automatically when set.
+
+set -euo pipefail
+
+IMAGE="${CLAUDE_BOX_IMAGE:-claude-box:latest}"
+# realpath: resolve through a symlink on PATH to find Dockerfile.claude.
+HERE="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+DEFAULT_MOUNTS="${CLAUDE_BOX_MOUNTS:-$PWD}"
+PIXI_ENV="${CLAUDE_BOX_ENV:-}"
+PIXI_MANIFEST="${CLAUDE_BOX_MANIFEST:-}"
+CLAUDE_DIR="${CLAUDE_BOX_CLAUDE_DIR:-/opt/claude-code}"
+CUDA_DIR="${CLAUDE_BOX_CUDA_DIR:-/opt/cuda}"
+
+# The container user mirrors the host user, so mounts resolve to identical
+# paths inside and --userns=keep-id maps writes back to us.
+BOX_USER="$(id -un)"
+BOX_UID="$(id -u)"
+BOX_GID="$(id -g)"
+BOX_HOME="/home/$BOX_USER"
+
+if [[ "${1:-}" == "--build" ]]; then
+    # --pull=newer: the image's glibc must keep up with the claude binary.
+    exec podman build --format docker --pull=newer \
+        --build-arg "USERNAME=$BOX_USER" \
+        --build-arg "UID=$BOX_UID" \
+        --build-arg "GID=$BOX_GID" \
+        -f "$HERE/Dockerfile.claude" -t "$IMAGE" "$HERE"
+fi
+
+if ! podman image exists "$IMAGE"; then
+    echo "claude-box: image '$IMAGE' not found. Build it with:" >&2
+    echo "    $0 --build" >&2
+    exit 1
+fi
+
+if [[ ! -x "$CLAUDE_DIR/bin/claude" ]]; then
+    echo "claude-box: no claude binary at $CLAUDE_DIR/bin/claude" >&2
+    echo "            Set CLAUDE_BOX_CLAUDE_DIR (see README.md)." >&2
+    exit 1
+fi
+
+# podman would create these as directories if missing, breaking host Claude.
+if [[ ! -d "$HOME/.claude" ]] ||
+   [[ "${CLAUDE_BOX_NO_CLAUDE_JSON:-0}" != "1" && ! -f "$HOME/.claude.json" ]]; then
+    echo "claude-box: ~/.claude or ~/.claude.json missing." >&2
+    echo "            Run claude once on the host first to create them." >&2
+    exit 1
+fi
+
+if [[ "$HOME" != "$BOX_HOME" ]]; then
+    echo "claude-box: warning: HOME is $HOME but the container home is $BOX_HOME;" >&2
+    echo "            ~/.claude will be mounted under $BOX_HOME." >&2
+fi
+
+# Mounts are passed through realpath, so a symlinked /home changes the paths
+# the container sees, and with them pixi prefixes and session history keys.
+if [[ "$(realpath "$HOME")" != "$HOME" ]]; then
+    echo "claude-box: warning: $HOME resolves to $(realpath "$HOME")." >&2
+    echo "            Pixi environments and session history may not match." >&2
+fi
+
+# --- mounts ---------------------------------------------------------------
+
+MOUNTS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m|--mount)
+            [[ -n "${2:-}" ]] || { echo "claude-box: $1 needs a directory" >&2; exit 1; }
+            MOUNTS+=( "$2" ); shift 2 ;;
+        -e|--env)
+            [[ -n "${2:-}" ]] || { echo "claude-box: $1 needs an environment name" >&2; exit 1; }
+            PIXI_ENV="$2"; shift 2 ;;
+        --manifest)
+            [[ -n "${2:-}" ]] || { echo "claude-box: $1 needs a pixi.toml path" >&2; exit 1; }
+            PIXI_MANIFEST="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+if [[ ${#MOUNTS[@]} -eq 0 ]]; then
+    IFS=':' read -r -a MOUNTS <<< "$DEFAULT_MOUNTS"
+fi
+
+# Compared after realpath, so `-m /home`, `-m ~/..` and a symlinked /home
+# cannot smuggle in $HOME (and with it ~/.ssh) through the back door.
+HOME_REAL="$(realpath "$HOME")"
+
+RESOLVED=()
+for dir in "${MOUNTS[@]}"; do
+    [[ -n "$dir" ]] || continue
+    if [[ ! -d "$dir" ]]; then
+        echo "claude-box: no such directory: $dir" >&2
+        exit 1
+    fi
+    real="$(realpath "$dir")"
+    if [[ "$real" == "/" || "$real" == "$HOME_REAL" || "$HOME_REAL" == "$real"/* ]]; then
+        echo "claude-box: refusing to mount '$real' -- it contains your home" >&2
+        echo "            directory. Mount specific project directories instead." >&2
+        exit 1
+    fi
+    # Not exhaustive: a deny-list never is. The real boundary is that nothing
+    # is mounted unless you name it.
+    for secret in "$HOME_REAL/.ssh" "$HOME_REAL/.gnupg" "$HOME_REAL/.aws" \
+                  "$HOME_REAL/.kube" "$HOME_REAL/.config/gh"; do
+        if [[ "$real" == "$secret" || "$real" == "$secret"/* ]]; then
+            echo "claude-box: refusing to mount '$real' -- keys stay on the host." >&2
+            exit 1
+        fi
+    done
+    RESOLVED+=( "$real" )
+done
+
+# Drop nested mounts, then duplicates, so podman never gets overlapping binds.
+FINAL=()
+for a in "${RESOLVED[@]}"; do
+    nested=0
+    for b in "${RESOLVED[@]}"; do
+        [[ "$a" == "$b" ]] && continue
+        [[ "$a" == "$b"/* ]] && { nested=1; break; }
+    done
+    [[ $nested -eq 0 ]] && FINAL+=( "$a" )
+done
+mapfile -t FINAL < <(printf '%s\n' "${FINAL[@]}" | awk '!seen[$0]++')
+
+if [[ ${#FINAL[@]} -eq 0 ]]; then
+    echo "claude-box: nothing to mount" >&2
+    exit 1
+fi
+
+PWD_REAL="$(realpath "$PWD")"
+WORKDIR="${FINAL[0]}"
+for m in "${FINAL[@]}"; do
+    if [[ "$PWD_REAL" == "$m" || "$PWD_REAL" == "$m"/* ]]; then
+        WORKDIR="$PWD_REAL"
+        break
+    fi
+done
+
+# --- assemble -------------------------------------------------------------
+
+ARGS=(
+    --rm -it
+    --userns=keep-id
+    --hostname claude-box
+    -e "TERM=${TERM:-xterm-256color}"
+    -v "$CLAUDE_DIR:$CLAUDE_DIR:ro"
+    -v "$HOME/.claude:$BOX_HOME/.claude"
+)
+
+if [[ "${CLAUDE_BOX_NO_CLAUDE_JSON:-0}" != "1" ]]; then
+    ARGS+=( -v "$HOME/.claude.json:$BOX_HOME/.claude.json" )
+else
+    # Container-only, but persistent: with --rm and no file at all, every
+    # launch would start from onboarding and folder-trust prompts.
+    BOX_JSON="${XDG_CACHE_HOME:-$HOME/.cache}/claude-box/claude.json"
+    mkdir -p "$(dirname "$BOX_JSON")"
+    [[ -f "$BOX_JSON" ]] || echo '{}' > "$BOX_JSON"
+    ARGS+=( -v "$BOX_JSON:$BOX_HOME/.claude.json" )
+fi
+
+# Most hosts set the timezone through /etc/localtime, not $TZ. podman takes
+# `local` or a zoneinfo name, so a POSIX-style $TZ (GMT0BST) is ignored.
+BOX_TZ=local
+[[ -n "${TZ:-}" && -e "/usr/share/zoneinfo/$TZ" ]] && BOX_TZ="$TZ"
+ARGS+=( --tz "$BOX_TZ" )
+
+# Forwarded by name, so the value never shows up in the host's process list.
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && ARGS+=( -e ANTHROPIC_API_KEY )
+
+if [[ -n "${CLAUDE_BOX_PASSENV:-}" ]]; then
+    IFS=':' read -r -a passenv <<< "$CLAUDE_BOX_PASSENV"
+    for var in "${passenv[@]}"; do
+        [[ -n "$var" ]] && ARGS+=( -e "$var" )
+    done
+fi
+
+# Rootless bind mounts are denied under SELinux without this. Relabelling
+# with :Z is not an option: it would break access from the host.
+if [[ -e /sys/fs/selinux/enforce ]]; then
+    ARGS+=( --security-opt label=disable )
+fi
+
+for m in "${FINAL[@]}"; do
+    ARGS+=( -v "$m:$m" )
+done
+
+# Git runs what it finds in a gitdir: hooks, config keys such as core.hooksPath
+# and core.pager, and whatever commondir redirects those to. All of it runs on
+# the *host*, with your keys, the next time you commit there.
+#
+# Read-only binds stop writes. Plain self-binds stop a directory being renamed
+# aside and replaced with a writable copy, which would defeat the read-only
+# binds: a mountpoint can be neither renamed nor unlinked.
+#
+# Cost: `git config`, `git remote add` and setting a branch upstream fail
+# inside; committing is unaffected.
+declare -A PINNED=() PROTECTED=()
+
+pin_dir() {
+    local d="$1"
+    [[ -n "${PINNED[$d]:-}" ]] && return 0
+    PINNED["$d"]=1
+    ARGS+=( -v "$d:$d" )
+}
+
+# Pin every directory from a mount root down to $1, so no ancestor can be
+# swapped out from under the read-only binds.
+pin_ancestors() {
+    local dir="$1" root="$2"
+    while [[ "$dir" != "$root" && "$dir" != "/" ]]; do
+        pin_dir "$dir"
+        dir="$(dirname "$dir")"
+    done
+}
+
+protect_gitdir() {
+    local gitdir="$1" wt mod
+    [[ -n "${PROTECTED[$gitdir]:-}" ]] && return 0
+    PROTECTED["$gitdir"]=1
+
+    # A hooks directory that does not exist yet would otherwise be created
+    # inside the container, and used by git on the host.
+    mkdir -p "$gitdir/hooks"
+    # Git takes config and hooks from wherever commondir points. "." keeps it
+    # looking inside the gitdir, which is what it does anyway.
+    [[ -f "$gitdir/commondir" ]] || echo "." > "$gitdir/commondir"
+
+    pin_dir "$gitdir"
+    [[ -f "$gitdir/config" ]] && ARGS+=( -v "$gitdir/config:$gitdir/config:ro" )
+    ARGS+=( -v "$gitdir/hooks:$gitdir/hooks:ro" )
+    ARGS+=( -v "$gitdir/commondir:$gitdir/commondir:ro" )
+
+    # Linked worktrees keep their metadata here and redirect the same way.
+    if [[ -d "$gitdir/worktrees" ]]; then
+        pin_dir "$gitdir/worktrees"
+        for wt in "$gitdir"/worktrees/*/; do
+            wt="${wt%/}"
+            [[ -d "$wt" ]] || continue
+            pin_dir "$wt"
+            [[ -f "$wt/commondir" ]] && ARGS+=( -v "$wt/commondir:$wt/commondir:ro" )
+            # The back-pointer to the checkout. Repointing it does not run
+            # anything, but it makes the worktree prunable, and the next
+            # `git worktree prune` or `git gc` then discards its metadata.
+            [[ -f "$wt/gitdir" ]] && ARGS+=( -v "$wt/gitdir:$wt/gitdir:ro" )
+        done
+    fi
+
+    # Each submodule has a full gitdir of its own, with its own config and
+    # hooks. Located by its config file, because a submodule path containing a
+    # slash nests the directory, and because HEAD also appears under refs/.
+    if [[ -d "$gitdir/modules" ]]; then
+        pin_dir "$gitdir/modules"
+        while IFS= read -r mod; do
+            [[ -f "$mod/HEAD" ]] || continue
+            pin_ancestors "$mod" "$gitdir/modules"
+            protect_gitdir "$mod"
+        done < <(find "$gitdir/modules" -mindepth 1 -maxdepth 6 -type f \
+                      -name config -printf '%h\n' 2>/dev/null)
+    fi
+}
+
+if [[ "${CLAUDE_BOX_UNSAFE_GIT:-0}" != "1" ]]; then
+    for m in "${FINAL[@]}"; do
+        while IFS= read -r gitdir; do
+            pin_ancestors "$(dirname "$gitdir")" "$m"
+            protect_gitdir "$gitdir"
+        done < <(find "$m" -maxdepth 4 -type d -name .git 2>/dev/null)
+
+        # A worktree or submodule checkout has .git as a *file* naming its real
+        # gitdir. Read-only so it cannot be repointed at one the container
+        # controls; the gitdir it names is protected above.
+        while IFS= read -r gitfile; do
+            pin_ancestors "$(dirname "$gitfile")" "$m"
+            ARGS+=( -v "$gitfile:$gitfile:ro" )
+        done < <(find "$m" -maxdepth 4 -type f -name .git 2>/dev/null)
+    done
+fi
+
+ARGS+=( -w "$WORKDIR" )
+
+# ~/.gnupg is not mounted, so signing cannot work inside.
+for cfg in .gitconfig .config/git/config; do
+    if [[ -f "$HOME/$cfg" ]]; then
+        ARGS+=( -v "$HOME/$cfg:$BOX_HOME/$cfg:ro" )
+    fi
+done
+
+# Mounted onto /usr/local/bin so pixi is on PATH wherever the host keeps it.
+PIXI_BIN="$(command -v pixi 2>/dev/null || true)"
+PIXI_IN_BOX=/usr/local/bin/pixi
+if [[ -n "$PIXI_BIN" ]]; then
+    PIXI_BIN="$(realpath "$PIXI_BIN")"
+    ARGS+=( -v "$PIXI_BIN:$PIXI_IN_BOX:ro" )
+fi
+
+PODMAN="$(command -v podman)"
+
+# herdr identifies an agent from the pane's foreground process name, which
+# would otherwise be `podman`, and its state hook reports over a Unix socket.
+# execve takes comm from the basename it is given, so running podman through a
+# symlink named `claude` makes the pane report the expected process.
+if [[ "${HERDR_ENV:-}" == "1" && -S "${HERDR_SOCKET_PATH:-}" ]]; then
+    while IFS='=' read -r name _; do
+        ARGS+=( -e "$name" )
+    done < <(env | grep '^HERDR_')
+    ARGS+=( -v "$HERDR_SOCKET_PATH:$HERDR_SOCKET_PATH" )
+
+    shim_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-box"
+    mkdir -p "$shim_dir"
+    ln -sfn "$PODMAN" "$shim_dir/claude"
+    PODMAN="$shim_dir/claude"
+fi
+
+if [[ "${CLAUDE_BOX_GPU:-0}" == "1" ]]; then
+    shopt -s nullglob
+    cdi_specs=( /etc/cdi/nvidia*.yaml /etc/cdi/nvidia*.json
+                /var/run/cdi/nvidia*.yaml /var/run/cdi/nvidia*.json )
+    shopt -u nullglob
+    if [[ ${#cdi_specs[@]} -eq 0 ]]; then
+        echo "claude-box: CLAUDE_BOX_GPU=1 but no CDI spec found." >&2
+        echo "            See README.md for the one-time host setup." >&2
+        exit 1
+    fi
+    ARGS+=( --device nvidia.com/gpu=all )
+    [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && ARGS+=( -e CUDA_VISIBLE_DEVICES )
+    # CDI injects only the driver; the toolkit (nvcc etc.) comes from the host.
+    [[ -d "$CUDA_DIR" ]] && ARGS+=( -v "$CUDA_DIR:/opt/cuda:ro" )
+fi
+
+# --- launch ---------------------------------------------------------------
+
+# Claude runs inside the activated environment so shells it spawns inherit it.
+if [[ -n "$PIXI_ENV" ]]; then
+    if [[ -z "$PIXI_BIN" ]]; then
+        echo "claude-box: --env $PIXI_ENV given, but pixi is not on PATH" >&2
+        exit 1
+    fi
+    # --frozen as well as --no-install, so no solve or lock-file write happens.
+    PIXI_ARGS=( run --no-install --frozen -e "$PIXI_ENV" )
+
+    # Without a pinned manifest pixi searches upward from the working
+    # directory, which picks up a subpackage's own environment.
+    if [[ -n "$PIXI_MANIFEST" ]]; then
+        PIXI_MANIFEST="$(realpath "$PIXI_MANIFEST" 2>/dev/null || echo "$PIXI_MANIFEST")"
+        if [[ ! -f "$PIXI_MANIFEST" ]]; then
+            echo "claude-box: no pixi manifest at $PIXI_MANIFEST" >&2
+            exit 1
+        fi
+        covered=0
+        for m in "${FINAL[@]}"; do
+            [[ "$PIXI_MANIFEST" == "$m"/* ]] && { covered=1; break; }
+        done
+        if [[ $covered -eq 0 ]]; then
+            echo "claude-box: manifest $PIXI_MANIFEST is outside every mount" >&2
+            echo "            add it with -m so the container can see it." >&2
+            exit 1
+        fi
+        PIXI_ARGS+=( --manifest-path "$PIXI_MANIFEST" )
+    else
+        # Stop at the mount: anything above it is invisible in the container.
+        # A pyproject.toml only counts as a manifest with a [tool.pixi] table.
+        probe="$WORKDIR" found="" stop=""
+        for m in "${FINAL[@]}"; do
+            [[ "$WORKDIR" == "$m" || "$WORKDIR" == "$m"/* ]] && { stop="$m"; break; }
+        done
+        while [[ "$probe" != "/" ]]; do
+            if [[ -f "$probe/pixi.toml" ]] ||
+               { [[ -f "$probe/pyproject.toml" ]] &&
+                 grep -q '^\[tool\.pixi' "$probe/pyproject.toml"; }; then
+                found="$probe"; break
+            fi
+            [[ -n "$stop" && "$probe" == "$stop" ]] && break
+            probe="$(dirname "$probe")"
+        done
+        if [[ -z "$found" ]]; then
+            echo "claude-box: --env $PIXI_ENV given, but no pixi manifest found" >&2
+            echo "            at or above $WORKDIR (within the mounted tree)" >&2
+            exit 1
+        fi
+    fi
+
+    exec "$PODMAN" run "${ARGS[@]}" --entrypoint "$PIXI_IN_BOX" "$IMAGE" \
+        "${PIXI_ARGS[@]}" "$CLAUDE_DIR/bin/claude" "$@"
+fi
+
+exec "$PODMAN" run "${ARGS[@]}" --entrypoint "$CLAUDE_DIR/bin/claude" "$IMAGE" "$@"

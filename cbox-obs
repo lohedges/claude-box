@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#
+# claude-box preset for OpenBioSim development:
+#
+#   - mounts the whole stack at $OBS_ROOT (default ~/Code/openbiosim)
+#   - passes through the NVIDIA GPU (sire's `dev` env gates on CUDA 12)
+#   - launches Claude inside sire's pixi `dev` environment, pinned to sire's
+#     manifest so a subpackage's own environment is never picked up instead
+#
+# Everything here is OBS-specific. Plain `cbox` stays generic.
+# Any argument passed through overrides these defaults.
+
+set -euo pipefail
+
+# realpath so this works when invoked through a symlink on PATH.
+HERE="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+
+OBS_ROOT="${OBS_ROOT:-$HOME/Code/openbiosim}"
+
+if [[ ! -d "$OBS_ROOT" ]]; then
+    echo "cbox-obs: no OpenBioSim stack at $OBS_ROOT" >&2
+    echo "          Set OBS_ROOT to your checkout (see README.md)." >&2
+    exit 1
+fi
+
+export CLAUDE_BOX_MOUNTS="${CLAUDE_BOX_MOUNTS:-$OBS_ROOT}"
+export CLAUDE_BOX_ENV="${CLAUDE_BOX_ENV:-dev}"
+export CLAUDE_BOX_MANIFEST="${CLAUDE_BOX_MANIFEST:-$OBS_ROOT/sire/pixi.toml}"
+export CLAUDE_BOX_GPU="${CLAUDE_BOX_GPU:-1}"
+
+exec "$HERE/claude-box" "$@"
