@@ -187,6 +187,14 @@ keep one exported for other work: container sessions will then bill the API
 rather than your subscription. Unset it for the launch if that is not what you
 want.
 
+Podman's default masks over parts of `/proc` are lifted with
+`--security-opt unmask=/proc/*`. Claude Code's own Bash sandbox (bubblewrap)
+mounts a fresh `/proc`, and the kernel refuses that while any of it is
+covered, so every command fails with `bwrap: Can't mount proc on /proc`.
+The masks add little in a rootless container: the kernel still checks
+permissions on `/proc/kcore`, `/proc/keys` and global sysctls against your
+real UID, not container root.
+
 On SELinux systems the script adds `--security-opt label=disable`, without
 which rootless bind mounts are denied. Relabelling with `:Z` is not used, as
 it would break access to the same files from the host. The trade-off is that

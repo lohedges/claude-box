@@ -201,6 +201,10 @@ if [[ -n "${CLAUDE_BOX_PASSENV:-}" ]]; then
     done
 fi
 
+# Claude Code's bwrap sandbox mounts a fresh /proc, which the kernel refuses
+# while podman's masks cover parts of the existing one.
+ARGS+=( --security-opt "unmask=/proc/*" )
+
 # Rootless bind mounts are denied under SELinux without this. Relabelling
 # with :Z is not an option: it would break access from the host.
 if [[ -e /sys/fs/selinux/enforce ]]; then
