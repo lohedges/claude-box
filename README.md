@@ -162,6 +162,7 @@ it. The script checks and tells you if not.
 | `~/.gitconfig`, `~/.config/git/config` (whichever exist) | ro | Commit identity |
 | `pixi` (wherever it is on PATH) | ro | Run project environments |
 | `$CLAUDE_BOX_CUDA_DIR` (default `/opt/cuda`), at `/opt/cuda` | ro | CUDA toolkit, only with `CLAUDE_BOX_GPU=1` |
+| `/usr/include/cccl`, `/usr/lib/cmake/{cccl,cub,libcudacxx,thrust}` (whichever exist) | ro | CCCL headers and CMake configs, which Arch packages separately and `/opt/cuda` links to; only with `CLAUDE_BOX_GPU=1` |
 
 Nothing else in `$HOME` is visible. In particular, **not** `~/.ssh` and
 **not** `~/.gnupg`.

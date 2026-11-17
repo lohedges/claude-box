@@ -355,7 +355,13 @@ if [[ "${CLAUDE_BOX_GPU:-0}" == "1" ]]; then
     ARGS+=( --device nvidia.com/gpu=all )
     [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && ARGS+=( -e CUDA_VISIBLE_DEVICES )
     # CDI injects only the driver; the toolkit (nvcc etc.) comes from the host.
-    [[ -d "$CUDA_DIR" ]] && ARGS+=( -v "$CUDA_DIR:/opt/cuda:ro" )
+    if [[ -d "$CUDA_DIR" ]]; then
+        ARGS+=( -v "$CUDA_DIR:/opt/cuda:ro" )
+        # Arch ships CCCL as its own package, and /opt/cuda symlinks into it.
+        for d in /usr/include/cccl /usr/lib/cmake/{cccl,cub,libcudacxx,thrust}; do
+            [[ -d "$d" ]] && ARGS+=( -v "$d:$d:ro" )
+        done
+    fi
 fi
 
 # --- launch ---------------------------------------------------------------
