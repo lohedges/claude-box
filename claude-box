@@ -163,6 +163,11 @@ for m in "${FINAL[@]}"; do
     fi
 done
 
+if [[ "$WORKDIR" != "$PWD_REAL" ]]; then
+    echo "claude-box: warning: $PWD_REAL is not mounted; starting in $WORKDIR." >&2
+    echo "            Add it with -m to work there and share its session history." >&2
+fi
+
 # --- assemble -------------------------------------------------------------
 
 ARGS=(

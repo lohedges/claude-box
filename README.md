@@ -98,7 +98,9 @@ your shell profile:
     cbox
 
 With no `-m`, the current directory is mounted. If you run it from inside a
-mounted directory it starts there; otherwise it starts at the first mount.
+mounted directory it starts there; otherwise it starts at the first mount and
+warns you, since that session's history is then kept under the first mount's
+path rather than the directory you launched from.
 Anything after the `claude-box` options is passed on to `claude`, so
 `cbox --continue` and `cbox --resume` work as usual. Put `-m`, `--env` and
 `--manifest` first; parsing stops at the first option `claude-box` does not
